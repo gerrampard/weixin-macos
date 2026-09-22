@@ -36,6 +36,9 @@ FIRST_SOURCE=$(echo "$source_files" | head -n 1)
 # 使用 sqlite3 的 .tables 命令和一些文本处理来获取表名列表
 TABLES=$(sqlite3 "$FIRST_SOURCE" ".tables" | tr ' ' '\n' | grep -v '^$' | sort | uniq | grep -vE "$IGNORED_TABLES")
 
+# 安全校验: 仅允许由字母、数字、下划线组成的合法表名，防止 SQL 注入
+TABLES=$(echo "$TABLES" | grep -E '^[A-Za-z_][A-Za-z0-9_]*$')
+
 if [ -z "$TABLES" ]; then
     echo "❌ 错误: 无法从第一个源数据库 (${FIRST_SOURCE}) 中获取可合并的表名。" >&2
     exit 1
