@@ -1,6 +1,6 @@
 var targetPath = "/Applications/WeChat.app/Contents/MacOS/WeChat";
 var module = Process.enumerateModules().find(function(m) {
-    return m.path === targetPath;
+    return m.path === targetPath || m.name === "WeChat";
 });
 if (!module) {
     throw new Error("[-] Cannot find module: " + targetPath);
@@ -8,12 +8,48 @@ if (!module) {
 var moduleBase = module.base;
 console.log("[+] WeChat module base: " + moduleBase);
 
-// Enumerate readable ranges within 500MB from module base to search for "req2buf"
+// 基址解析(2026-09-20 E类事故修正): 模块表优先。真身 wechat.dylib 是全进程唯一
+// >50MB 的同名模块(Frameworks/下是16KB stub), 基址确定无竞态。
+// 原 "req2buf字符串+>100MB range" 扫描存在竞态误命中: 堆里 MallocHelperZone
+// (合并range>100MB, rw-) 也有 "req2buf" 字符串拷贝, 扫描回调先到就赢 →
+// 基址定到堆上, 全部 hook 挂空, 登录后零事件(静默死亡, 无报错)。
 var searchSize = 1000 * 1024 * 1024;
 var searchEnd = moduleBase.add(searchSize);
 var _req2bufSearchAddr = null;
 var baseAddr = null;
 
+// 结构版本开关: 4.1.12 起上传完成结构 +0x08、下载任务结构 +0x18、寄存器漂移。
+// JSON 里 "structVer": "2" = 4.1.12 布局; 旧版 JSON 无此键(渲染为 <no value>),
+// 不等于 "2", 自动走 4.1.11 及以前的原路径。
+var structVer = "{{.structVer}}";
+
+function resolveBaseFromModuleTable() {
+    var wechatModules = Process.enumerateModules().filter(function(m) {
+        return m.name === "wechat.dylib";
+    });
+    wechatModules.sort(function(a, b) { return b.size - a.size; });
+    if (wechatModules.length > 0 && wechatModules[0].size > 50 * 1024 * 1024) {
+        return wechatModules[0];
+    }
+    return null;
+}
+
+// 必须 setImmediate 派发: initAddresses 内部依赖脚本中部 var 全局的初始化
+// (fakeVtable 等)。同步调用会抢在 var 初始化前执行, var 随后又把已赋值的
+// 全局重置回 ptr(0) —— 2026-09-20 D类 文本发送崩溃(fakeVtable=0 虚调用)即此因。
+setImmediate(function () {
+    var realModule = resolveBaseFromModuleTable();
+    if (realModule) {
+        baseAddr = realModule.base;
+        console.log("[+] 基址解析(模块表): " + realModule.path + " base=" + baseAddr + " size=" + realModule.size);
+        initAddresses();
+    } else {
+        console.log("[!] 模块表未找到真身 wechat.dylib, 回退 req2buf 字符串扫描");
+        resolveBaseByScan();
+    }
+});
+
+function resolveBaseByScan() {
 var ranges = Process.enumerateRanges("r--").filter(function(r) {
     var rangeEnd = r.base.add(r.size);
     return r.base.compare(searchEnd) < 0 && rangeEnd.compare(moduleBase) > 0;
@@ -32,9 +68,10 @@ ranges.forEach(function(r) {
             if (_req2bufSearchAddr === null) {
                 var rangeInfo = Process.findRangeByAddress(address);
                 if (rangeInfo) {
-                    if (rangeInfo.size > 100 * 1024 * 1024) {
+                    // 必须是可执行映射: 排除堆区(MallocHelperZone等)里的字符串拷贝
+                    if (rangeInfo.size > 100 * 1024 * 1024 && rangeInfo.protection.indexOf("x") !== -1) {
                         _req2bufSearchAddr = address;
-                        console.log("[+] Range size > 100MB, accepted as base address");
+                        console.log("[+] Range size > 100MB & executable, accepted as base address");
                     }
                 }
             }
@@ -46,7 +83,7 @@ ranges.forEach(function(r) {
             pending--;
             if (pending === 0) {
                 if (_req2bufSearchAddr === null) {
-                    throw new Error("[-] Cannot find 'req2buf' keyword in a range > 100MB");
+                    throw new Error("[-] Cannot find 'req2buf' keyword in an executable range > 100MB");
                 }
 
                 var foundRange = Process.findRangeByAddress(_req2bufSearchAddr);
@@ -59,6 +96,7 @@ ranges.forEach(function(r) {
         }
     });
 });
+}
 
 function initAddresses() {
     // 文本消息全局变量 (new_text.js approach)
@@ -210,8 +248,22 @@ function sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl) {
 // 2026-09-02 静态分析 4.1.10: 上传/下载分发链(0x4e5a6e4/0x4e5a7f4)都走
 // GetService("default")[0x4ca2130] -> 按类型名 "N4mars3cdn10CdnManagerE" getter[0x4e59dec]
 // -> [ctx+0x40]。该单例登录后即注册进全局服务表, 不需要先发一张图片触发。
+// ⚠️ 2026-09-03 事故教训: 登录未完成时服务表锁被登录流程持有, 此时在 Frida 线程调
+// GetService 会与微信主线程死锁, 微信整个冻结。因此必须有"登录稳定门禁":
+// 只在 (收到过任意同步消息 = 确已登录) 或 (脚本已跑 60s) 之后才允许解析。
+var scriptLoadTime = Date.now();
+var incomingTrafficSeen = false;
+function loginSettled() {
+    if (incomingTrafficSeen) return true;
+    if (Date.now() - scriptLoadTime > 60 * 1000) return true;
+    return false;
+}
 function resolveCdnManager() {
     if (cdnGetServiceAddr.equals(ptr(0)) || cdnManagerGetterAddr.equals(ptr(0))) {
+        return ptr(0);
+    }
+    if (!loginSettled()) {
+        console.log("[!] 登录尚未稳定, 暂缓 CdnManager 解析(防死锁), 稍后任务重试");
         return ptr(0);
     }
     try {
@@ -310,19 +362,27 @@ var textMessageAddr = ptr(0);
 var sendMessageCallbackFunc;
 var retOneStub = ptr(0);
 var fakeVtable = ptr(0);
-var pendingInsertMsgAddr = ptr(0);  // 等待buf2resp后清理的insertMsgAddr
-var pendingSendMsgType = "";  // 等待buf2resp回调时使用的消息类型
-var pendingBuf2RespTaskId = 0;  // 等待buf2resp匹配的taskId
+// 等待buf2resp的任务表: taskId -> { addr, msgType, timerId }
+// 支持多任务并存 + 超时兜底: ack迟迟不来时提前清零 X24+0x60, 避免mars
+// 回收死任务时对伪造结构体做虚调用/delete导致SIGSEGV (2026-08-17 crash)
+var pendingBuf2RespTasks = {};
+// 正常ack在1s内返回; 3s未回视为失败。必须赶在mars短链CGI失败窗口(~5s)之前
+// 复原原始指针: 8/20崩溃即任务无ack, ~5s失败回调在协程线程erase任务map时踩坏
+// 节点, 10s兜底来不及。original指针本就是sendFunc构造的合法消息, 提前复原=
+// 回到原生行为; 迟到ack仍能命中(entry保留30s), 只是entry.addr已空不再清理
+var PENDING_CLEANUP_TIMEOUT_MS = 3 * 1000;
 var textProtoDataAddr = ptr(0);
 
 
 // 双方公共使用的地址
 var triggerX1Payload;
+var triggerTaskSnapshot = null;
 var triggerX0;
 var req2bufEnterAddr;
 var req2bufExitAddr;
 var sendFuncAddr;
 var insertMsgAddr = ptr(0);
+var originalInsertMsgPtr = ptr(0);  // hook前X24+0x60的原始消息指针, 超时兜底时复原
 var sendMsgType = "";
 var buf2RespAddr;
 
@@ -635,12 +695,16 @@ function AttachSendFunc() {
     Interceptor.attach(sendFuncAddr.add(0x10), {
         onEnter: function (args) {
 
-            if (triggerX1Payload) {
-                return
-            }
-
+            // 每次都刷新捕获(upstream 只抓第一次): 保证 payload 指向最近的任务,
+            // 并快照完整任务结构(入口时任务已完整构造, 含回调子对象);
+            // 注入前整块恢复, 避免复用 free 后残骸里的野回调指针(4.1.12 崩溃根因)
             triggerX0 = this.context.x0;
             triggerX1Payload = this.context.x1;
+            try {
+                triggerTaskSnapshot = triggerX1Payload.readByteArray(0x300);
+            } catch (e) {
+                console.log("[-] 任务快照失败: " + e);
+            }
             console.log(`[+] 捕获到 StartTask 调用，X0：${triggerX0}, Payload: ${triggerX1Payload}`);
         }
     })
@@ -649,6 +713,61 @@ function AttachSendFunc() {
 
 // -------------------------发送文本消息分区-------------------------
 
+
+// -------------------------buf2resp超时兜底分区-------------------------
+// req2bufExit后登记待ack任务: 命中buf2resp时清理指针并取消timer;
+// 超时未命中则复原X24+0x60的原始指针(而不是清零/留着伪造结构体),
+// 任务回到未注入的合法状态, mars无论重试重序列化还是超时回收delete都安全
+function armPendingBuf2RespTask(taskId, addr, msgType, originalPtr) {
+    pendingBuf2RespTasks[taskId] = {
+        addr: addr,
+        msgType: msgType,
+        originalPtr: originalPtr || ptr(0),
+        timerId: setTimeout(function () {
+            fallbackCleanupPendingTask(taskId);
+        }, PENDING_CLEANUP_TIMEOUT_MS),
+    };
+}
+
+// ack命中: 取消timer并移除登记, 返回entry供调用方读取msgType
+function finishPendingBuf2RespTask(taskId) {
+    var entry = pendingBuf2RespTasks[taskId];
+    if (!entry) {
+        return null;
+    }
+    delete pendingBuf2RespTasks[taskId];
+    if (entry.timerId !== null) {
+        clearTimeout(entry.timerId);
+        entry.timerId = null;
+    }
+    return entry;
+}
+
+// 超时兜底: 复原X24+0x60为原始消息指针(与成功路径写0不同, 此时任务
+// 可能仍被mars重试, 必须留合法对象)。entry再保留30s, 迟到的ack
+// 仍能匹配并把响应转发给Go (此时entry.addr已空, 只转发不再清理)
+function fallbackCleanupPendingTask(taskId) {
+    var entry = pendingBuf2RespTasks[taskId];
+    if (!entry) {
+        return;
+    }
+    entry.timerId = null;
+    try {
+        if (!entry.originalPtr.isNull()) {
+            entry.addr.writePointer(entry.originalPtr);
+            console.log("[!] buf2resp超时兜底: 已复原原始消息指针, msgType=" + entry.msgType + " taskId=" + taskId);
+        } else {
+            entry.addr.writeU64(0x0);
+            console.log("[!] buf2resp超时兜底: 原始指针不可用, 已清零 insertMsgAddr, msgType=" + entry.msgType + " taskId=" + taskId);
+        }
+    } catch (e) {
+        console.error("[!] buf2resp超时兜底清理失败: taskId=" + taskId + " err=" + e);
+    }
+    entry.addr = ptr(0);
+    setTimeout(function () {
+        delete pendingBuf2RespTasks[taskId];
+    }, 30 * 1000);
+}
 
 // -------------------------Req2Buf公共部分分区-------------------------
 function attachReq2buf() {
@@ -660,6 +779,9 @@ function attachReq2buf() {
 
             const x24_base = this.context.x24;
             insertMsgAddr = x24_base.add(0x60);
+            // 保存hook前的原始消息指针(校验过可读), 超时兜底时复原,
+            // 让任务回到未注入的合法状态, mars重试/回收/delete都不会踩到伪造结构体
+            originalInsertMsgPtr = readPointerIfReadable(insertMsgAddr);
 
             if (sendMsgType === "text") {
                 insertMsgAddr.writePointer(sendTextMessageAddr);
@@ -705,9 +827,8 @@ function attachReq2buf() {
             }
             // 不立即清除insertMsgAddr，让mars能路由buf2resp回调
             // 用fakeVtable保护结构体，防止中间被访问时崩溃
-            pendingInsertMsgAddr = insertMsgAddr;
-            pendingSendMsgType = sendMsgType;
-            pendingBuf2RespTaskId = taskIdGlobal;
+            // 登记任务并挂超时兜底timer: ack超时则复原X24+0x60原始指针
+            armPendingBuf2RespTask(taskIdGlobal, insertMsgAddr, sendMsgType, originalInsertMsgPtr);
             taskIdGlobal = 0;
         }
     });
@@ -845,6 +966,10 @@ function triggerSendMediaMessage(taskId, sender, receiver, protoHex, payloadHex,
     info.sendMessageAddr.add(0x20).writeU32(taskIdGlobal);
 
     const payloadData = hexToByteArray(payloadHex);
+    // 先恢复完整任务结构快照(重建合法回调子对象, free 残骸的野回调指针会崩)
+    if (triggerTaskSnapshot) {
+        triggerX1Payload.writeByteArray(triggerTaskSnapshot);
+    }
     triggerX1Payload.writeByteArray(payloadData);
     triggerX1Payload.add(0x18).writePointer(info.cgiAddr);
     triggerX1Payload.add(0xb8).writePointer(triggerX1Payload.add(0xc0));
@@ -933,13 +1058,38 @@ function attachUploadMedia() {
 
 
 
+// 视频上传成功钥匙缓存: cdnKey -> { aesKey, md5Key, videoId }
+// CDN 秒传去重的响应不带 aesKey, 按 cdnKey 命中回填 (见 patchCdnOnComplete)
+var cdnVideoKeyCache = {};
+
+// Go 启动时回灌持久化(./cdn_video_keys.json)的钥匙, 解决缓存跨进程丢失:
+// onebot 重启后同一视频首次上传必撞秒传去重(响应无 aesKey), 内存缓存为空
+// 就只能 abort → send timeout (2026-09-07 四次实锤)
+function hydrateCdnVideoCache(jsonStr) {
+    var persisted = JSON.parse(jsonStr);
+    var n = 0;
+    for (var k in persisted) {
+        if (persisted.hasOwnProperty(k) && persisted[k] && persisted[k].aesKey && !cdnVideoKeyCache[k]) {
+            cdnVideoKeyCache[k] = persisted[k];
+            n++;
+        }
+    }
+    console.log("[+] hydrateCdnVideoCache: 回灌 " + n + " 条视频钥匙");
+    return n;
+}
+
 function patchCdnOnComplete() {
     Interceptor.attach(cndOnCompleteAddr, {
         onEnter: function (args) {
 
             try {
                 const x2 = this.context.x2;
-                const currentFileId = x2.add(0x20).readPointer().readUtf8String();
+                // 4.1.12(structVer=2): 完成结构整体 +0x08 (DIAG 实证: fileId 0x20→0x28,
+                // cdnKey 0x60→0x68, aesKey 0x78→0x80, md5Key 0x90→0x98, targetId 0x40→0x48);
+                // 且 videoId 字段整个消失(宽扫 0x00-0x260 无候选, 见 docs/version-upgrade.md
+                // 铁律9), structVer=2 直接传空串
+                const cndShift = (structVer === "2") ? 0x08 : 0;
+                const currentFileId = x2.add(0x20 + cndShift).readPointer().readUtf8String();
                 const imageFileId = imageIdAddr.readUtf8String();
                 const videoFileId = videoIdAddr.readUtf8String();
                 const voiceFileId = voiceIdAddr.readUtf8String();
@@ -950,11 +1100,11 @@ function patchCdnOnComplete() {
                     return;
                 }
 
-                const cdnKey = x2.add(0x60).readPointer().readUtf8String();
-                const aesKey = x2.add(0x78).readPointer().readUtf8String();
-                const md5Key = x2.add(0x90).readPointer().readUtf8String();
-                const videoId = x2.add(0xf0).readPointer().readUtf8String();
-                const targetId = x2.add(0x40).readUtf8String();
+                const cdnKey = x2.add(0x60 + cndShift).readPointer().readUtf8String();
+                const aesKey = x2.add(0x78 + cndShift).readPointer().readUtf8String();
+                const md5Key = x2.add(0x90 + cndShift).readPointer().readUtf8String();
+                const videoId = (structVer === "2") ? "" : x2.add(0xf0).readPointer().readUtf8String();
+                const targetId = x2.add(0x40 + cndShift).readUtf8String();
 
                 console.log("cndOnComplete x2: " + x2 + " cdnKey: " + cdnKey + " aesKey: " + aesKey + " md5Key: " + md5Key + " videoId: " + videoId + " targetId: " + targetId);
 
@@ -985,14 +1135,18 @@ function patchCdnOnComplete() {
                             overwrite_msg_id: ""
                         });
                     } else if (currentFileId === videoFileId) {
-                        // 视频
+                        // 视频: 缓存成功上传的钥匙, 供秒传去重时回填
+                        // videoId || "" 兜底: null 会让 Go 侧 videoId.(string) panic
+                        // (被 main.go recover 吞掉, 表现为 HTTP 超时假象); proto3 空 bytes
+                        // 字段会被省略, 4.1.12 实测服务端 ack、视频可播放
+                        cdnVideoKeyCache[cdnKey] = { aesKey: aesKey, md5Key: md5Key, videoId: videoId || "" };
                         send({
                             type: "upload_video_finish",
                             target_id: targetId,
                             cdn_key: cdnKey,
                             aes_key: aesKey,
                             md5_key: md5Key,
-                            video_id: videoId
+                            video_id: videoId || ""
                         });
                     } else {
                         // 图片
@@ -1004,6 +1158,21 @@ function patchCdnOnComplete() {
                             md5_key: md5Key
                         });
                     }
+                } else if (currentFileId === videoFileId && cdnKey !== "" && cdnKey != null && cdnVideoKeyCache[cdnKey]) {
+                    // CDN 秒传去重: 同一视频重复上传时服务端直接返回已有 filekey
+                    // (cdnKey 相同), 但响应不带 aesKey/md5Key (2026-08-27 先发个人再发群,
+                    // 群发送三次全部死在 "cdnKey or aesKey 为空")。文件就是上次我们自己传的,
+                    // 回填缓存钥匙即可正确解密; videoId 优先用本次响应里的(秒传响应会带)。
+                    var cached = cdnVideoKeyCache[cdnKey];
+                    console.log("[+] cndOnComplete 秒传命中, 回填缓存钥匙 cdnKey: " + cdnKey);
+                    send({
+                        type: "upload_video_finish",
+                        target_id: targetId,
+                        cdn_key: cdnKey,
+                        aes_key: cached.aesKey,
+                        md5_key: cached.md5Key,
+                        video_id: (videoId !== "" && videoId != null) ? videoId : (cached.videoId || "")
+                    });
                 } else {
                     console.error("cdnKey or aesKey 为空");
                 }
@@ -1101,6 +1270,7 @@ function triggerSendVoiceMessage(taskId, sender, receiver, protoHex, payloadHex)
 // -------------------------发送语音消息分区-------------------------
 
 rpc.exports = {
+    hydrateCdnVideoCache: hydrateCdnVideoCache,
     triggerSendImgMessage: triggerSendImgMessage,
     triggerUploadImg: triggerUploadImg,
     triggerSendTextMessage: triggerSendTextMessage,
@@ -1136,34 +1306,50 @@ function setReceiver() {
 			var respTaskId = this.context.sp.add(0x140).readS32();
 			const currentPtr = this.context.x20;
 			const x2 = this.context.x0.toInt32();
+            // 先处理我们发送任务的ack: 无论响应数据是否可读, 清理动作都必须执行
+            // (错误响应往往指针不可读, 在校验前早退会跳过清理留下悬空伪造指针)
+            var pendingEntry = finishPendingBuf2RespTask(respTaskId);
+            if (pendingEntry && !pendingEntry.addr.isNull()) {
+                // 成功路径同样复原原始消息指针, 而不是写0: 已完成的任务若带 NULL
+                // 消息指针留在 mars 任务 map 里, 后续(数秒~数天后)清理 erase 时会
+                // 踩坏红黑树 (2026-09-02 02:22 crash: 文本成功后留下 NULL 节点,
+                // 图片失败的清理路径踩雷)。originalPtr 是 sendFunc 构造的合法消息,
+                // 复原后任务全程处于原生合法状态, OnTaskEnd 按原生流程回收即可
+                try {
+                    if (pendingEntry.originalPtr && !pendingEntry.originalPtr.isNull()) {
+                        pendingEntry.addr.writePointer(pendingEntry.originalPtr);
+                        console.log("[+] buf2resp: 已复原原始消息指针, msgType=" + pendingEntry.msgType + " taskId=" + respTaskId);
+                    } else {
+                        pendingEntry.addr.writeU64(0x0);
+                        console.log("[+] buf2resp: 原始指针不可用, 已清零 insertMsgAddr, msgType=" + pendingEntry.msgType + " taskId=" + respTaskId);
+                    }
+                } catch (e) {
+                    console.error("[!] buf2resp 清理异常: taskId=" + respTaskId + " err=" + e);
+                }
+            }
+
             if (!isReadablePointer(currentPtr) || x2 < 4 || x2 > MAX_FRIDA_MESSAGE_BYTES) {
-                console.error("[-] buf2resp: pointer 不可读 或 x2 大小不正确, ptr=" + currentPtr + " x2=" + x2);
+                if (pendingEntry) {
+                    console.log("[+] buf2resp: ack响应数据不可读, 已跳过数据转发, taskId=" + respTaskId);
+                } else {
+                    console.error("[-] buf2resp: pointer 不可读 或 x2 大小不正确, ptr=" + currentPtr + " x2=" + x2);
+                }
 				return;
             }
 
             // 判断是否是我们发送的消息的 ack
-            if (pendingBuf2RespTaskId !== 0 && respTaskId === pendingBuf2RespTaskId) {
-                // 清理 insertMsgAddr
-                if (!pendingInsertMsgAddr.isNull()) {
-                    pendingInsertMsgAddr.writeU64(0x0);
-                    console.log("[+] buf2resp: 已清理 insertMsgAddr, msgType=" + pendingSendMsgType + " taskId=" + respTaskId);
-                    pendingInsertMsgAddr = ptr(0);
-                }
-
+            if (pendingEntry) {
                 // 读取响应数据
 				var respData = x2 >= 4 && x2 <= MAX_FRIDA_MESSAGE_BYTES ? readByteArrayIfReadable(currentPtr, x2) : null;
 				if (respData) {
 					var bytes = new Uint8Array(respData);
-					console.log("[+] buf2resp: 收到响应, msgType=" + pendingSendMsgType + " taskId=" + respTaskId + " len=" + x2);
+					console.log("[+] buf2resp: 收到响应, msgType=" + pendingEntry.msgType + " taskId=" + respTaskId + " len=" + x2);
 					send({
 						type: "buf2resp",
-						msg_type: pendingSendMsgType,
+						msg_type: pendingEntry.msgType,
 						data: Array.from(bytes),
 					});
 				}
-
-				pendingBuf2RespTaskId = 0;
-				pendingSendMsgType = "";
 				return
             }
 
@@ -1179,6 +1365,8 @@ function setReceiver() {
                 return;
             }
 
+            // 任何同步消息到达 = 微信已登录, 解锁 CdnManager 解析门禁
+            incomingTrafficSeen = true;
             send({
                 type: "protobuf_msg",
                 data: Array.from(uint8Array),
@@ -1211,12 +1399,20 @@ function setReceiver() {
         }
     })
 
+    // 4.1.12(structVer=2) 下载链路漂移(DIAG 实证, 详见 docs/version-upgrade.md):
+    // - file/imag 数据寄存器 x22→x21 (寄存器分配漂移, JSON hook 点即 mov x1,xN 指令)
+    // - 任务结构 +0x18: fileId 0x2E0→0x2F8, cdnUrl 0x2F8→0x310
+    // - 视频数据变为 libc++ std::string(x20+0x178), 长度必须读结构体(4.1.12 x23=0)
+    var dlIsV2 = (structVer === "2");
+    var dlFileIdOff = dlIsV2 ? 0x2F8 : 0x2E0;
+    var dlCdnUrlOff = dlIsV2 ? 0x310 : 0x2F8;
+
     Interceptor.attach(downloadFileAddr, {
         onEnter: function (args) {
-			var dataPtr = this.context.x22;
+			var dataPtr = dlIsV2 ? this.context.x21 : this.context.x22;
 			var dataLen = this.context.x2.toInt32();
-			var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2E0)));
-			var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2F8)));
+			var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlFileIdOff)));
+			var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlCdnUrlOff)));
 
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }
@@ -1224,10 +1420,10 @@ function setReceiver() {
 
     Interceptor.attach(downloadImagAddr, {
         onEnter: function (args) {
-            var dataPtr = this.context.x22;
+            var dataPtr = dlIsV2 ? this.context.x21 : this.context.x22;
             var dataLen = this.context.x2.toInt32();
-            var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2E0)));
-            var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2F8)));
+            var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlFileIdOff)));
+            var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlCdnUrlOff)));
 
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }
@@ -1235,10 +1431,27 @@ function setReceiver() {
 
     Interceptor.attach(downloadVideoAddr, {
         onEnter: function (args) {
-			var dataPtr = readPointerIfReadable(this.context.x20.add(0x178));
-			var dataLen = this.context.x23.toInt32();
-			var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2E0)));
-			var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2F8)));
+            var dataPtr, dataLen;
+            if (dlIsV2) {
+                // libc++ std::string at x20+0x178: 数据指针 [+0], 长度 [+8],
+                // SSO 旗标 [+0x17]&0x80 (短串数据内联在对象里)
+                var sObj = this.context.x20.add(0x178);
+                try {
+                    var ssoFlag = sObj.add(0x17).readU8();
+                    if (ssoFlag & 0x80) {
+                        dataPtr = sObj;
+                        dataLen = ssoFlag & 0x7f;
+                    } else {
+                        dataPtr = readPointerIfReadable(sObj);
+                        dataLen = sObj.add(8).readU64().toUInt32();
+                    }
+                } catch (e) { dataPtr = ptr(0); dataLen = 0; }
+            } else {
+			    dataPtr = readPointerIfReadable(this.context.x20.add(0x178));
+			    dataLen = this.context.x23.toInt32();
+            }
+			var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlFileIdOff)));
+			var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlCdnUrlOff)));
 
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }
